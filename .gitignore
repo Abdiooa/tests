@@ -1,0 +1,85 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+pip-wheel-metadata/
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# Environment files and secrets
+.env
+.env.*
+
+# Logs and debug
+*.log
+server.log
+
+# Unit test / coverage reports
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.pytest_cache/
+
+# Type checker / linter caches
+.mypy_cache/
+.ruff_cache/
+.pyright/
+
+# IDEs and editors
+.idea/
+.vscode/
+*.code-workspace
+
+# Local caches
+.cache/
+.tox/
+.nox/
+
+# Databases
+*.sqlite
+*.sqlite3
+*.db
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Node (in case of frontend tooling)
+node_modules/
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Uvicorn/Starlette temp
+staticfiles/
+media/
+
+
