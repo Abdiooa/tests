@@ -82,4 +82,7 @@ node_modules/
 staticfiles/
 media/
 
+# CSV export files
+records/
+
 

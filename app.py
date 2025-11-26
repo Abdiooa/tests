@@ -1,12 +1,12 @@
-from fastapi import FastAPI, Query
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, Query, status
+from fastapi.responses import JSONResponse, Response
 from contextlib import asynccontextmanager
 import asyncio
 from datetime import datetime, timezone
 from typing import Optional, List
 from decimal import Decimal
 import logging
-from sqlalchemy import select, func
+from sqlalchemy import select, func, text
 from zoneinfo import ZoneInfo
 
 from models import (
@@ -17,6 +17,7 @@ from database import init_database, close_database, AsyncSessionLocal
 from db_models import (
     CdrRecordDB, PdrRecordDB, SdrRecordDB, EdrRecordDB, TopUpRecordDB
 )
+from csv_exporter import CsvExporter
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -26,8 +27,13 @@ logger = logging.getLogger(__name__)
 # Database storage
 class RecordStorage:
     def __init__(self):
+        import os
         self.generator = XdrRecordGenerator()
         self.generation_task: Optional[asyncio.Task] = None
+        self.csv_export_task: Optional[asyncio.Task] = None
+        records_dir = os.getenv("RECORDS_DIR", "./records")
+        self.csv_exporter = CsvExporter(records_dir=records_dir, buffer_seconds=10)
+        self.last_exported_minute: Optional[datetime] = None
     
     def _pydantic_to_db_model(self, pydantic_obj, db_model_class):
         """Convert Pydantic model to SQLAlchemy model"""
@@ -270,6 +276,49 @@ class RecordStorage:
                 await self.generation_task
             except asyncio.CancelledError:
                 logger.info("Record generation task cancelled")
+    
+    async def start_csv_export(self):
+        """Start the background CSV export task (runs every minute)"""
+        async def export_csv_records():
+            logger.info("Starting CSV export task (every 1 minute)")
+            # Wait a bit before first export to ensure we have some records
+            await asyncio.sleep(30)
+            
+            while True:
+                try:
+                    # Export the last completed minute
+                    results = await self.csv_exporter.export_last_minute()
+                    
+                    # Log results
+                    success_count = sum(1 for success in results.values() if success)
+                    total_count = len(results)
+                    logger.info(
+                        f"CSV export completed: {success_count}/{total_count} record types exported successfully"
+                    )
+                    
+                    # Log details for each type
+                    for record_type, success in results.items():
+                        if success:
+                            logger.debug(f"  ✓ {record_type.upper()} exported successfully")
+                        else:
+                            logger.warning(f"  ✗ {record_type.upper()} export failed")
+                    
+                except Exception as e:
+                    logger.error(f"Error in CSV export task: {e}")
+                
+                # Wait 60 seconds before next export
+                await asyncio.sleep(60)
+        
+        self.csv_export_task = asyncio.create_task(export_csv_records())
+    
+    async def stop_csv_export(self):
+        """Stop the background CSV export task"""
+        if self.csv_export_task:
+            self.csv_export_task.cancel()
+            try:
+                await self.csv_export_task
+            except asyncio.CancelledError:
+                logger.info("CSV export task cancelled")
 
 
 # Initialize storage
@@ -279,15 +328,17 @@ storage = RecordStorage()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifecycle manager for FastAPI application"""
-    # Startup: Initialize database and start background task
+    # Startup: Initialize database and start background tasks
     logger.info("Starting Telecom XDR API Service")
     logger.info("Initializing database...")
     await init_database()
     logger.info("Database initialized successfully")
     await storage.start_generation()
+    await storage.start_csv_export()
     yield
-    # Shutdown: Stop background task and close database connections
+    # Shutdown: Stop background tasks and close database connections
     logger.info("Shutting down Telecom XDR API Service")
+    await storage.stop_csv_export()
     await storage.stop_generation()
     await close_database()
 
@@ -307,12 +358,96 @@ async def root():
     return {
         "service": "Telecom XDR Records API",
         "version": "1.0.0",
-        "description": "Generates XDR records every 15 seconds",
+        "description": "Generates XDR records every 15 seconds and exports to CSV every 1 minute",
         "endpoints": {
+            "/health": "Health check endpoint (supports GET and HEAD)",
             "/api/data": "Get all XDR records (supports 'since' and 'until' timestamp parameters)",
-            "/api/stats": "Get statistics about stored records"
+            "/api/stats": "Get statistics about stored records",
+            "/api/export/csv": "Manually trigger CSV export for the last completed minute",
+            "/api/data (DELETE)": "Clear all stored records"
+        },
+        "csv_export": {
+            "enabled": True,
+            "interval": "1 minute",
+            "location": "./records",
+            "format": "{type}_YYYYMMDDTHHMMSS-YYYYMMDDTHHMMSS.csv"
         }
     }
+
+
+@app.get("/health")
+@app.head("/health")
+async def health_check():
+    """
+    Health check endpoint for monitoring and load balancers.
+    Supports both GET (returns JSON) and HEAD (returns status only) requests.
+    
+    Checks:
+    - Database connectivity
+    - Background task status (record generation and CSV export)
+    
+    Returns:
+    - 200 OK: All systems operational
+    - 503 Service Unavailable: One or more components are unhealthy
+    """
+    health_status = {
+        "status": "healthy",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "checks": {}
+    }
+    
+    overall_healthy = True
+    
+    # Check database connectivity
+    try:
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(text("SELECT 1"))
+            result.scalar()
+            health_status["checks"]["database"] = {
+                "status": "healthy",
+                "message": "Database connection successful"
+            }
+    except Exception as e:
+        logger.error(f"Database health check failed: {e}")
+        health_status["checks"]["database"] = {
+            "status": "unhealthy",
+            "message": f"Database connection failed: {str(e)}"
+        }
+        overall_healthy = False
+    
+    # Check background tasks
+    generation_running = storage.generation_task is not None and not storage.generation_task.done()
+    csv_export_running = storage.csv_export_task is not None and not storage.csv_export_task.done()
+    
+    health_status["checks"]["background_tasks"] = {
+        "status": "healthy" if (generation_running and csv_export_running) else "unhealthy",
+        "details": {
+            "record_generation": {
+                "running": generation_running,
+                "status": "running" if generation_running else "stopped"
+            },
+            "csv_export": {
+                "running": csv_export_running,
+                "status": "running" if csv_export_running else "stopped"
+            }
+        }
+    }
+    
+    if not (generation_running and csv_export_running):
+        overall_healthy = False
+        health_status["status"] = "unhealthy"
+    
+    # Set overall status
+    if not overall_healthy:
+        health_status["status"] = "unhealthy"
+    
+    # Return appropriate status code
+    status_code = status.HTTP_200_OK if overall_healthy else status.HTTP_503_SERVICE_UNAVAILABLE
+    
+    return JSONResponse(
+        content=health_status,
+        status_code=status_code
+    )
 
 
 @app.get("/api/data")
@@ -397,6 +532,35 @@ async def clear_data():
         "message": "All records cleared successfully from database",
         "timestamp": datetime.now()
     }
+
+
+@app.post("/api/export/csv")
+async def export_csv_manual():
+    """
+    Manually trigger CSV export for the last completed minute.
+    This is useful for testing or manual exports.
+    """
+    try:
+        results = await storage.csv_exporter.export_last_minute()
+        
+        success_count = sum(1 for success in results.values() if success)
+        total_count = len(results)
+        
+        return {
+            "message": f"CSV export completed: {success_count}/{total_count} record types exported",
+            "results": results,
+            "timestamp": datetime.now()
+        }
+    except Exception as e:
+        logger.error(f"Error in manual CSV export: {e}")
+        return JSONResponse(
+            status_code=500,
+            content={
+                "error": "Failed to export CSV",
+                "message": str(e),
+                "timestamp": datetime.now()
+            }
+        )
 
 
 if __name__ == "__main__":
